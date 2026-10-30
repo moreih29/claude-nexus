@@ -3,7 +3,7 @@
 // src/statusline/statusline.ts
 import { existsSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
-import { execSync, spawn } from "node:child_process";
+import { execSync, spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
@@ -20,8 +20,8 @@ function getNum(key) {
   return m ? parseFloat(m[1]) : 0;
 }
 function findProjectRoot(start) {
-  let dir = start ?? process.cwd();
-  while (dir !== "/") {
+  let dir = resolve(start ?? process.cwd());
+  while (resolve(dir, "..") !== dir) {
     if (existsSync(join(dir, ".git")))
       return dir;
     dir = resolve(dir, "..");
@@ -32,6 +32,7 @@ var PROJECT_ROOT = findProjectRoot(getVal("cwd") || process.cwd());
 var HOME = homedir();
 var CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || join(HOME, ".claude");
 var PLUGIN_ROOT = process.env.CLAUDE_PLUGIN_ROOT || "";
+var SCRIPT_PATH = fileURLToPath(import.meta.url);
 var KEYCHAIN_SERVICE = (() => {
   const envDir = process.env.CLAUDE_CONFIG_DIR;
   if (!envDir)
@@ -49,7 +50,7 @@ function getPluginVersion() {
     } catch {}
   }
   try {
-    const scriptDir = dirname(fileURLToPath(import.meta.url));
+    const scriptDir = dirname(SCRIPT_PATH);
     const manifest = JSON.parse(readFileSync(join(scriptDir, "..", "package.json"), "utf-8"));
     if (typeof manifest.version === "string")
       return manifest.version;
@@ -99,10 +100,7 @@ function updateAvailable(current) {
       }
     } catch {}
   }
-  try {
-    const script = `RESP=$(curl -s --max-time 3 "https://api.github.com/repos/moreih29/claude-nexus/releases/latest" 2>/dev/null); VER=$(echo "$RESP" | grep -o '"tag_name":"[^"]*"' | sed 's/"tag_name":"v\\{0,1\\}//;s/"//'); [ -n "$VER" ] && printf '%s\\n%s\\n' "$(date +%s)" "$VER" > "${VERSION_CACHE_PATH}.tmp" && mv "${VERSION_CACHE_PATH}.tmp" "${VERSION_CACHE_PATH}"`;
-    spawn("sh", ["-c", script], { stdio: "ignore", detached: true }).unref();
-  } catch {}
+  spawnRefresh("version");
   if (existsSync(VERSION_CACHE_PATH)) {
     try {
       const lines = readFileSync(VERSION_CACHE_PATH, "utf-8").split(`
@@ -156,98 +154,124 @@ var USAGE_CACHE_PATH = join(CLAUDE_CONFIG_DIR, ".usage_cache");
 var CACHE_TTL_DEFAULT = 60;
 var FETCH_BACKOFF = 300;
 var STALE_THRESHOLD = 300;
-function writeCacheAtomic(content) {
+function writeAtomic(path, content) {
   try {
-    writeFileSync(USAGE_CACHE_PATH + ".tmp", content);
-    renameSync(USAGE_CACHE_PATH + ".tmp", USAGE_CACHE_PATH);
+    writeFileSync(path + ".tmp", content);
+    renameSync(path + ".tmp", path);
   } catch {
     try {
-      unlinkSync(USAGE_CACHE_PATH + ".tmp");
+      unlinkSync(path + ".tmp");
     } catch {}
   }
 }
-function triggerBackgroundFetch(dataTimestamp, cachedData) {
-  const now = Math.floor(Date.now() / 1000);
-  if (cachedData) {
-    writeCacheAtomic(`${dataTimestamp}
-${now + CACHE_TTL_DEFAULT}
-${cachedData}`);
-  }
+function readUsageCache() {
+  const out = { dataTimestamp: 0, nextFetchAfter: 0, cachedData: "" };
+  if (!existsSync(USAGE_CACHE_PATH))
+    return out;
   try {
-    let tokenCmd = "";
-    if (process.platform === "darwin") {
-      tokenCmd = `TOKEN=$(security find-generic-password -s "${KEYCHAIN_SERVICE}" -w 2>/dev/null | grep -o '"accessToken":"[^"]*"' | sed 's/"accessToken":"//;s/"//')`;
-    } else {
-      const credFile = join(CLAUDE_CONFIG_DIR, ".credentials.json");
-      tokenCmd = `TOKEN=$(grep -o '"accessToken":"[^"]*"' "${credFile}" 2>/dev/null | sed 's/"accessToken":"//;s/"//')`;
-    }
-    const script = `
-      ${tokenCmd}
-      [ -z "$TOKEN" ] && exit 1
-      RESP=$(curl -s --max-time 3 "https://api.anthropic.com/api/oauth/usage" -H "Authorization: Bearer $TOKEN" -H "anthropic-beta: oauth-2025-04-20" 2>/dev/null)
-      NOW=$(date +%s)
-      if echo "$RESP" | grep -q "five_hour"; then
-        printf '%s\\n%s\\n%s\\n' "$NOW" "$((NOW + ${CACHE_TTL_DEFAULT}))" "$RESP" > "${USAGE_CACHE_PATH}.tmp" && mv "${USAGE_CACHE_PATH}.tmp" "${USAGE_CACHE_PATH}"
-      else
-        OLD_TS=$(head -1 "${USAGE_CACHE_PATH}" 2>/dev/null)
-        OLD_DATA=$(sed -n '3p' "${USAGE_CACHE_PATH}" 2>/dev/null)
-        [ -n "$OLD_DATA" ] && printf '%s\\n%s\\n%s\\n' "$OLD_TS" "$((NOW + ${FETCH_BACKOFF}))" "$OLD_DATA" > "${USAGE_CACHE_PATH}.tmp" && mv "${USAGE_CACHE_PATH}.tmp" "${USAGE_CACHE_PATH}"
-      fi
-    `;
-    spawn("sh", ["-c", script], { stdio: "ignore", detached: true }).unref();
-  } catch {}
-}
-function readUsage() {
-  const now = Math.floor(Date.now() / 1000);
-  let dataTimestamp = 0;
-  let nextFetchAfter = 0;
-  let cachedData = "";
-  if (existsSync(USAGE_CACHE_PATH)) {
-    try {
-      const lines = readFileSync(USAGE_CACHE_PATH, "utf-8").split(`
+    const lines = readFileSync(USAGE_CACHE_PATH, "utf-8").split(`
 `);
-      dataTimestamp = parseInt(lines[0]) || 0;
-      const line1 = parseInt(lines[1]) || 0;
-      if (line1 > 1e6) {
-        nextFetchAfter = line1;
-        cachedData = lines[2] || "";
-      } else {
-        nextFetchAfter = dataTimestamp + (line1 || CACHE_TTL_DEFAULT);
-        cachedData = lines[2] || "";
-      }
-    } catch {}
-  }
-  const age = dataTimestamp > 0 ? now - dataTimestamp : 0;
-  if (cachedData && now < nextFetchAfter) {
-    return { json: cachedData, stale: age >= STALE_THRESHOLD, ageSeconds: age };
-  }
-  if (cachedData) {
-    triggerBackgroundFetch(dataTimestamp, cachedData);
-    return { json: cachedData, stale: age >= STALE_THRESHOLD, ageSeconds: age };
-  }
+    out.dataTimestamp = parseInt(lines[0]) || 0;
+    const line1 = parseInt(lines[1]) || 0;
+    out.nextFetchAfter = line1 > 1e6 ? line1 : out.dataTimestamp + (line1 || CACHE_TTL_DEFAULT);
+    out.cachedData = lines[2] || "";
+  } catch {}
+  return out;
+}
+function readAccessToken() {
   try {
     let credJson = "";
     if (process.platform === "darwin") {
       credJson = execSync(`security find-generic-password -s "${KEYCHAIN_SERVICE}" -w`, {
         encoding: "utf-8",
         stdio: ["pipe", "pipe", "pipe"]
-      }).trim();
+      });
     } else {
       const credFile = join(CLAUDE_CONFIG_DIR, ".credentials.json");
       if (existsSync(credFile))
         credJson = readFileSync(credFile, "utf-8");
     }
-    const tokenMatch = credJson.match(/"accessToken"\s*:\s*"([^"]+)"/);
-    if (tokenMatch) {
-      const resp = execSync(`curl -s --max-time 2 "https://api.anthropic.com/api/oauth/usage" -H "Authorization: Bearer ${tokenMatch[1]}" -H "anthropic-beta: oauth-2025-04-20"`, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
-      if (resp && resp.includes("five_hour")) {
-        writeCacheAtomic(`${now}
+    const token = JSON.parse(credJson)?.claudeAiOauth?.accessToken;
+    return typeof token === "string" ? token : "";
+  } catch {
+    return "";
+  }
+}
+async function refreshUsage() {
+  const token = readAccessToken();
+  let resp = "";
+  if (token) {
+    try {
+      const r = await fetch("https://api.anthropic.com/api/oauth/usage", {
+        headers: { Authorization: `Bearer ${token}`, "anthropic-beta": "oauth-2025-04-20" },
+        signal: AbortSignal.timeout(3000)
+      });
+      const body = await r.json();
+      if (body && typeof body === "object" && "five_hour" in body)
+        resp = JSON.stringify(body);
+    } catch {}
+  }
+  const now = Math.floor(Date.now() / 1000);
+  if (resp) {
+    writeAtomic(USAGE_CACHE_PATH, `${now}
 ${now + CACHE_TTL_DEFAULT}
-${resp}`);
-        return { json: resp, stale: false, ageSeconds: 0 };
-      }
+${resp}
+`);
+    return;
+  }
+  const { dataTimestamp, cachedData } = readUsageCache();
+  if (cachedData)
+    writeAtomic(USAGE_CACHE_PATH, `${dataTimestamp}
+${now + FETCH_BACKOFF}
+${cachedData}
+`);
+}
+async function refreshVersion() {
+  try {
+    const r = await fetch("https://api.github.com/repos/moreih29/claude-nexus/releases/latest", {
+      headers: { "User-Agent": "claude-nexus-statusline", Accept: "application/vnd.github+json" },
+      signal: AbortSignal.timeout(3000)
+    });
+    const tag = (await r.json())?.tag_name;
+    if (typeof tag === "string" && tag) {
+      writeAtomic(VERSION_CACHE_PATH, `${Math.floor(Date.now() / 1000)}
+${tag.replace(/^v/, "")}
+`);
     }
   } catch {}
+}
+function spawnRefresh(kind) {
+  try {
+    const child = spawn(process.execPath, [SCRIPT_PATH, "--refresh", kind], {
+      stdio: "ignore",
+      detached: true,
+      windowsHide: true
+    });
+    child.on("error", () => {});
+    child.unref();
+  } catch {}
+}
+function readUsage() {
+  const now = Math.floor(Date.now() / 1000);
+  let { dataTimestamp, nextFetchAfter, cachedData } = readUsageCache();
+  const age = () => dataTimestamp > 0 ? now - dataTimestamp : 0;
+  if (cachedData && now < nextFetchAfter) {
+    return { json: cachedData, stale: age() >= STALE_THRESHOLD, ageSeconds: age() };
+  }
+  if (cachedData) {
+    writeAtomic(USAGE_CACHE_PATH, `${dataTimestamp}
+${now + CACHE_TTL_DEFAULT}
+${cachedData}
+`);
+    spawnRefresh("usage");
+    return { json: cachedData, stale: age() >= STALE_THRESHOLD, ageSeconds: age() };
+  }
+  try {
+    spawnSync(process.execPath, [SCRIPT_PATH, "--refresh", "usage"], { stdio: "ignore", timeout: 5000, windowsHide: true });
+  } catch {}
+  ({ dataTimestamp, cachedData } = readUsageCache());
+  if (cachedData)
+    return { json: cachedData, stale: false, ageSeconds: 0 };
   return null;
 }
 function utilPct(parsed, section) {
@@ -396,16 +420,6 @@ function scanLocalCostUsd() {
   }
   return total;
 }
-function writeCostCacheAtomic(content) {
-  try {
-    writeFileSync(COST_CACHE_PATH + ".tmp", content);
-    renameSync(COST_CACHE_PATH + ".tmp", COST_CACHE_PATH);
-  } catch {
-    try {
-      unlinkSync(COST_CACHE_PATH + ".tmp");
-    } catch {}
-  }
-}
 function readApiCost() {
   const now = Math.floor(Date.now() / 1000);
   let dataTimestamp = 0;
@@ -434,7 +448,7 @@ function readApiCost() {
   if (cost === null) {
     return { cost: null, stale: false, ageSeconds: 0 };
   }
-  writeCostCacheAtomic(`${now}
+  writeAtomic(COST_CACHE_PATH, `${now}
 ${now + COST_CACHE_TTL}
 ${cost}`);
   return { cost, stale: false, ageSeconds: 0 };
@@ -493,9 +507,14 @@ function main() {
 ` + buildLine2() + `
 `);
 }
-try {
-  main();
-} catch {
-  process.stdout.write(`nexus
+var refreshKind = process.argv[2] === "--refresh" ? process.argv[3] : "";
+if (refreshKind === "usage" || refreshKind === "version") {
+  (refreshKind === "usage" ? refreshUsage() : refreshVersion()).finally(() => process.exit(0));
+} else {
+  try {
+    main();
+  } catch {
+    process.stdout.write(`nexus
 `);
+  }
 }

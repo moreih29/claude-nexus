@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.34.2] - 2026-10-30
+
+### Fixed
+
+- **statusline 5h/7d 사용량이 갱신되지 않고 처음 받은 값에 멈춤.** 백그라운드 갱신이 자격 증명 JSON에서 `grep -o '"accessToken":"[^"]*"'`로 토큰을 뽑았는데, MCP 서버 OAuth 항목(`mcpOAuth.*.accessToken`, 빈 값일 수 있음)이 `claudeAiOauth`보다 앞에 있으면 두 줄이 잡혀 `Authorization` 헤더에 줄바꿈이 들어가고 curl이 `(43) bad argument`로 실패했다. 실패하면 옛 값을 유지하고 5분 뒤 재시도하므로 캐시가 처음 값에서 영원히 멈췄다(`N ago` 표시). 자격 증명을 JSON으로 파싱해 `claudeAiOauth.accessToken`만 쓰도록 바꿨다. 첫 실행 경로의 정규식도 같은 함수로 대체해 다른 토큰을 집을 여지를 없앴고, 토큰이 명령줄 인자로 노출되지 않는다.
+- **Windows에서 statusline이 동작하지 않던 부분.**
+  - 프로젝트 루트 탐색이 `"/"`에 닿을 때까지 올라가 Windows 드라이브 루트(`C:\`)에서 끝나지 않을 수 있었다 → 상위 경로가 자기 자신이면 멈춘다.
+  - 사용량·새 버전 확인이 `sh -c` + `curl`·`grep`·`sed`·`date`·`mv`에 의존했다 → 같은 스크립트를 `--refresh usage|version` 자식 프로세스(현재 런타임의 `process.execPath`)로 띄워 Node `fetch`와 `fs`만으로 처리한다. 자식은 `windowsHide`로 창을 띄우지 않고, 실행 실패는 무시한다.
+
+### Notes
+
+- 사용자 조치 불필요. 멈춰 있던 사용량 캐시는 업데이트 후 첫 갱신 주기(60초)에 새 값으로 바뀐다.
+- 캐시 파일 형식(`.usage_cache`·`.nexus_version_cache`·`.api_cost_cache`)은 그대로다.
+- 영향 범위: `src/statusline/statusline.ts`(`scripts/statusline.mjs` 재빌드). 훅·스킬·에이전트·MCP 인터페이스 변경 없음.
+
 ## [0.34.1] - 2026-05-08
 
 ### Fixed
