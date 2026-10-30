@@ -7,7 +7,7 @@
     {
       "name": "claude-nexus",
       "description": "Claude Code plugin for nexus-core agent orchestration",
-      "version": "0.34.1",
+      "version": "0.34.2",
       "author": {
         "name": "kih"
       },

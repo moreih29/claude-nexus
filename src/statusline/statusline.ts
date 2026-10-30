@@ -2,10 +2,12 @@
 // Nexus statusline — Claude Code statusLine.command
 // Reads JSON session data on stdin (display_name, used_percentage, cwd, etc.)
 // Cross-session cache at $CLAUDE_CONFIG_DIR/.usage_cache (default ~/.claude) prevents concurrent fetches.
+// Network refreshes run as `node statusline.mjs --refresh usage|version` in a detached child —
+// plain Node (fetch + fs), no sh/curl/grep, so the same code runs on macOS, Linux and Windows.
 
 import { existsSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
-import { execSync, spawn } from "node:child_process";
+import { execSync, spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
@@ -31,8 +33,9 @@ function getNum(key: string): number {
 // ── paths ──────────────────────────────────────────────
 
 function findProjectRoot(start?: string): string {
-  let dir = start ?? process.cwd();
-  while (dir !== "/") {
+  let dir = resolve(start ?? process.cwd());
+  // Stop at the filesystem root — "/" on POSIX, "C:\" on Windows (its parent is itself).
+  while (resolve(dir, "..") !== dir) {
     if (existsSync(join(dir, ".git"))) return dir;
     dir = resolve(dir, "..");
   }
@@ -43,6 +46,7 @@ const PROJECT_ROOT = findProjectRoot(getVal("cwd") || process.cwd());
 const HOME = homedir();
 const CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || join(HOME, ".claude");
 const PLUGIN_ROOT = process.env.CLAUDE_PLUGIN_ROOT || "";
+const SCRIPT_PATH = fileURLToPath(import.meta.url);
 
 // macOS keychain service name. Mirrors Claude Code's own algorithm:
 //   default (CLAUDE_CONFIG_DIR unset) → "Claude Code-credentials"
@@ -68,7 +72,7 @@ function getPluginVersion(): string {
   }
   // CLI context (bunx/npx/global install): read our own package.json next to the bundled script.
   try {
-    const scriptDir = dirname(fileURLToPath(import.meta.url));
+    const scriptDir = dirname(SCRIPT_PATH);
     const manifest = JSON.parse(readFileSync(join(scriptDir, "..", "package.json"), "utf-8"));
     if (typeof manifest.version === "string") return manifest.version;
   } catch {
@@ -129,12 +133,7 @@ function updateAvailable(current: string): boolean {
     }
   }
 
-  try {
-    const script = `RESP=$(curl -s --max-time 3 "https://api.github.com/repos/moreih29/claude-nexus/releases/latest" 2>/dev/null); VER=$(echo "$RESP" | grep -o '"tag_name":"[^"]*"' | sed 's/"tag_name":"v\\{0,1\\}//;s/"//'); [ -n "$VER" ] && printf '%s\\n%s\\n' "$(date +%s)" "$VER" > "${VERSION_CACHE_PATH}.tmp" && mv "${VERSION_CACHE_PATH}.tmp" "${VERSION_CACHE_PATH}"`;
-    spawn("sh", ["-c", script], { stdio: "ignore", detached: true }).unref();
-  } catch {
-    /* skip */
-  }
+  spawnRefresh("version");
 
   if (existsSync(VERSION_CACHE_PATH)) {
     try {
@@ -202,13 +201,13 @@ const CACHE_TTL_DEFAULT = 60; // s
 const FETCH_BACKOFF = 300; // s on failure
 const STALE_THRESHOLD = 300; // show "ago" when data older than 5 min
 
-function writeCacheAtomic(content: string): void {
+function writeAtomic(path: string, content: string): void {
   try {
-    writeFileSync(USAGE_CACHE_PATH + ".tmp", content);
-    renameSync(USAGE_CACHE_PATH + ".tmp", USAGE_CACHE_PATH);
+    writeFileSync(path + ".tmp", content);
+    renameSync(path + ".tmp", path);
   } catch {
     try {
-      unlinkSync(USAGE_CACHE_PATH + ".tmp");
+      unlinkSync(path + ".tmp");
     } catch {
       /* skip */
     }
@@ -216,42 +215,105 @@ function writeCacheAtomic(content: string): void {
 }
 
 /**
- * Background OAuth fetch → cache. Cache format (3 lines):
+ * Usage cache format (3 lines):
  *   {data_timestamp}     — when the data was actually fetched (for stale indicator)
  *   {next_fetch_after}   — no new fetch allowed before this (dedupe across sessions)
  *   {response_json}
  */
-function triggerBackgroundFetch(dataTimestamp: number, cachedData: string): void {
-  const now = Math.floor(Date.now() / 1000);
-
-  // Claim next_fetch_after immediately so concurrent sessions don't re-fetch.
-  if (cachedData) {
-    writeCacheAtomic(`${dataTimestamp}\n${now + CACHE_TTL_DEFAULT}\n${cachedData}`);
-  }
-
+function readUsageCache(): { dataTimestamp: number; nextFetchAfter: number; cachedData: string } {
+  const out = { dataTimestamp: 0, nextFetchAfter: 0, cachedData: "" };
+  if (!existsSync(USAGE_CACHE_PATH)) return out;
   try {
-    let tokenCmd = "";
-    if (process.platform === "darwin") {
-      tokenCmd = `TOKEN=$(security find-generic-password -s "${KEYCHAIN_SERVICE}" -w 2>/dev/null | grep -o '"accessToken":"[^"]*"' | sed 's/"accessToken":"//;s/"//')`;
-    } else {
-      const credFile = join(CLAUDE_CONFIG_DIR, ".credentials.json");
-      tokenCmd = `TOKEN=$(grep -o '"accessToken":"[^"]*"' "${credFile}" 2>/dev/null | sed 's/"accessToken":"//;s/"//')`;
-    }
+    const lines = readFileSync(USAGE_CACHE_PATH, "utf-8").split("\n");
+    out.dataTimestamp = parseInt(lines[0]) || 0;
+    const line1 = parseInt(lines[1]) || 0;
+    // legacy format kept a ttl on line 2
+    out.nextFetchAfter = line1 > 1_000_000 ? line1 : out.dataTimestamp + (line1 || CACHE_TTL_DEFAULT);
+    out.cachedData = lines[2] || "";
+  } catch {
+    /* skip */
+  }
+  return out;
+}
 
-    const script = `
-      ${tokenCmd}
-      [ -z "$TOKEN" ] && exit 1
-      RESP=$(curl -s --max-time 3 "https://api.anthropic.com/api/oauth/usage" -H "Authorization: Bearer $TOKEN" -H "anthropic-beta: oauth-2025-04-20" 2>/dev/null)
-      NOW=$(date +%s)
-      if echo "$RESP" | grep -q "five_hour"; then
-        printf '%s\\n%s\\n%s\\n' "$NOW" "$((NOW + ${CACHE_TTL_DEFAULT}))" "$RESP" > "${USAGE_CACHE_PATH}.tmp" && mv "${USAGE_CACHE_PATH}.tmp" "${USAGE_CACHE_PATH}"
-      else
-        OLD_TS=$(head -1 "${USAGE_CACHE_PATH}" 2>/dev/null)
-        OLD_DATA=$(sed -n '3p' "${USAGE_CACHE_PATH}" 2>/dev/null)
-        [ -n "$OLD_DATA" ] && printf '%s\\n%s\\n%s\\n' "$OLD_TS" "$((NOW + ${FETCH_BACKOFF}))" "$OLD_DATA" > "${USAGE_CACHE_PATH}.tmp" && mv "${USAGE_CACHE_PATH}.tmp" "${USAGE_CACHE_PATH}"
-      fi
-    `;
-    spawn("sh", ["-c", script], { stdio: "ignore", detached: true }).unref();
+/**
+ * Claude Code's own OAuth access token (claudeAiOauth.accessToken).
+ * The credentials JSON also holds MCP servers' OAuth entries (mcpOAuth.*.accessToken, possibly empty),
+ * so matching the first "accessToken" in the text can pick one of those instead.
+ */
+function readAccessToken(): string {
+  try {
+    let credJson = "";
+    if (process.platform === "darwin") {
+      credJson = execSync(`security find-generic-password -s "${KEYCHAIN_SERVICE}" -w`, {
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } else {
+      // Linux and Windows: $CLAUDE_CONFIG_DIR/.credentials.json
+      const credFile = join(CLAUDE_CONFIG_DIR, ".credentials.json");
+      if (existsSync(credFile)) credJson = readFileSync(credFile, "utf-8");
+    }
+    const token = JSON.parse(credJson)?.claudeAiOauth?.accessToken;
+    return typeof token === "string" ? token : "";
+  } catch {
+    return "";
+  }
+}
+
+/** Child mode `--refresh usage`: fetch → cache. On failure keep the old data and back off. */
+async function refreshUsage(): Promise<void> {
+  const token = readAccessToken();
+  let resp = "";
+  if (token) {
+    try {
+      const r = await fetch("https://api.anthropic.com/api/oauth/usage", {
+        headers: { Authorization: `Bearer ${token}`, "anthropic-beta": "oauth-2025-04-20" },
+        signal: AbortSignal.timeout(3000),
+      });
+      const body = await r.json();
+      if (body && typeof body === "object" && "five_hour" in body) resp = JSON.stringify(body); // one line for the cache
+    } catch {
+      /* skip */
+    }
+  }
+  const now = Math.floor(Date.now() / 1000);
+  if (resp) {
+    writeAtomic(USAGE_CACHE_PATH, `${now}\n${now + CACHE_TTL_DEFAULT}\n${resp}\n`);
+    return;
+  }
+  const { dataTimestamp, cachedData } = readUsageCache();
+  if (cachedData) writeAtomic(USAGE_CACHE_PATH, `${dataTimestamp}\n${now + FETCH_BACKOFF}\n${cachedData}\n`);
+}
+
+/** Child mode `--refresh version`: latest GitHub release → version cache. */
+async function refreshVersion(): Promise<void> {
+  try {
+    const r = await fetch("https://api.github.com/repos/moreih29/claude-nexus/releases/latest", {
+      headers: { "User-Agent": "claude-nexus-statusline", Accept: "application/vnd.github+json" },
+      signal: AbortSignal.timeout(3000),
+    });
+    const tag = ((await r.json()) as { tag_name?: unknown } | null)?.tag_name;
+    if (typeof tag === "string" && tag) {
+      writeAtomic(VERSION_CACHE_PATH, `${Math.floor(Date.now() / 1000)}\n${tag.replace(/^v/, "")}\n`);
+    }
+  } catch {
+    /* skip */
+  }
+}
+
+/** Run a refresh in a detached child of the same runtime (node or bun) — the statusline itself never waits. */
+function spawnRefresh(kind: "usage" | "version"): void {
+  try {
+    const child = spawn(process.execPath, [SCRIPT_PATH, "--refresh", kind], {
+      stdio: "ignore",
+      detached: true,
+      windowsHide: true,
+    });
+    child.on("error", () => {
+      /* skip */
+    });
+    child.unref();
   } catch {
     /* skip */
   }
@@ -259,65 +321,28 @@ function triggerBackgroundFetch(dataTimestamp: number, cachedData: string): void
 
 function readUsage(): { json: string; stale: boolean; ageSeconds: number } | null {
   const now = Math.floor(Date.now() / 1000);
-  let dataTimestamp = 0;
-  let nextFetchAfter = 0;
-  let cachedData = "";
-
-  if (existsSync(USAGE_CACHE_PATH)) {
-    try {
-      const lines = readFileSync(USAGE_CACHE_PATH, "utf-8").split("\n");
-      dataTimestamp = parseInt(lines[0]) || 0;
-      const line1 = parseInt(lines[1]) || 0;
-      if (line1 > 1_000_000) {
-        nextFetchAfter = line1;
-        cachedData = lines[2] || "";
-      } else {
-        // legacy ttl format
-        nextFetchAfter = dataTimestamp + (line1 || CACHE_TTL_DEFAULT);
-        cachedData = lines[2] || "";
-      }
-    } catch {
-      /* skip */
-    }
-  }
-
-  const age = dataTimestamp > 0 ? now - dataTimestamp : 0;
+  let { dataTimestamp, nextFetchAfter, cachedData } = readUsageCache();
+  const age = () => (dataTimestamp > 0 ? now - dataTimestamp : 0);
 
   if (cachedData && now < nextFetchAfter) {
-    return { json: cachedData, stale: age >= STALE_THRESHOLD, ageSeconds: age };
+    return { json: cachedData, stale: age() >= STALE_THRESHOLD, ageSeconds: age() };
   }
 
   if (cachedData) {
-    triggerBackgroundFetch(dataTimestamp, cachedData);
-    return { json: cachedData, stale: age >= STALE_THRESHOLD, ageSeconds: age };
+    // Claim next_fetch_after immediately so concurrent sessions don't re-fetch.
+    writeAtomic(USAGE_CACHE_PATH, `${dataTimestamp}\n${now + CACHE_TTL_DEFAULT}\n${cachedData}\n`);
+    spawnRefresh("usage");
+    return { json: cachedData, stale: age() >= STALE_THRESHOLD, ageSeconds: age() };
   }
 
-  // First run — synchronous fetch.
+  // First run — wait for one refresh, then read what it cached.
   try {
-    let credJson = "";
-    if (process.platform === "darwin") {
-      credJson = execSync(`security find-generic-password -s "${KEYCHAIN_SERVICE}" -w`, {
-        encoding: "utf-8",
-        stdio: ["pipe", "pipe", "pipe"],
-      }).trim();
-    } else {
-      const credFile = join(CLAUDE_CONFIG_DIR, ".credentials.json");
-      if (existsSync(credFile)) credJson = readFileSync(credFile, "utf-8");
-    }
-    const tokenMatch = credJson.match(/"accessToken"\s*:\s*"([^"]+)"/);
-    if (tokenMatch) {
-      const resp = execSync(
-        `curl -s --max-time 2 "https://api.anthropic.com/api/oauth/usage" -H "Authorization: Bearer ${tokenMatch[1]}" -H "anthropic-beta: oauth-2025-04-20"`,
-        { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] },
-      ).trim();
-      if (resp && resp.includes("five_hour")) {
-        writeCacheAtomic(`${now}\n${now + CACHE_TTL_DEFAULT}\n${resp}`);
-        return { json: resp, stale: false, ageSeconds: 0 };
-      }
-    }
+    spawnSync(process.execPath, [SCRIPT_PATH, "--refresh", "usage"], { stdio: "ignore", timeout: 5000, windowsHide: true });
   } catch {
     /* skip */
   }
+  ({ dataTimestamp, cachedData } = readUsageCache());
+  if (cachedData) return { json: cachedData, stale: false, ageSeconds: 0 };
   return null;
 }
 
@@ -518,19 +543,6 @@ function scanLocalCostUsd(): number | null {
   return total;
 }
 
-function writeCostCacheAtomic(content: string): void {
-  try {
-    writeFileSync(COST_CACHE_PATH + ".tmp", content);
-    renameSync(COST_CACHE_PATH + ".tmp", COST_CACHE_PATH);
-  } catch {
-    try {
-      unlinkSync(COST_CACHE_PATH + ".tmp");
-    } catch {
-      /* skip */
-    }
-  }
-}
-
 /**
  * Returns today's API cost in USD with a 60s cache. `null` only when the
  * Claude projects directory itself is missing (i.e., new install with no
@@ -569,7 +581,7 @@ function readApiCost(): { cost: number | null; stale: boolean; ageSeconds: numbe
   if (cost === null) {
     return { cost: null, stale: false, ageSeconds: 0 };
   }
-  writeCostCacheAtomic(`${now}\n${now + COST_CACHE_TTL}\n${cost}`);
+  writeAtomic(COST_CACHE_PATH, `${now}\n${now + COST_CACHE_TTL}\n${cost}`);
   return { cost, stale: false, ageSeconds: 0 };
 }
 
@@ -641,8 +653,13 @@ function main(): void {
   process.stdout.write(buildLine1() + "\n" + buildLine2() + "\n");
 }
 
-try {
-  main();
-} catch {
-  process.stdout.write("nexus\n");
+const refreshKind = process.argv[2] === "--refresh" ? process.argv[3] : "";
+if (refreshKind === "usage" || refreshKind === "version") {
+  (refreshKind === "usage" ? refreshUsage() : refreshVersion()).finally(() => process.exit(0));
+} else {
+  try {
+    main();
+  } catch {
+    process.stdout.write("nexus\n");
+  }
 }

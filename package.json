@@ -1,6 +1,6 @@
 {
   "name": "claude-nexus",
-  "version": "0.34.1",
+  "version": "0.34.2",
   "type": "module",
   "description": "Claude Code plugin for nexus-core agent orchestration",
   "author": "kih",
